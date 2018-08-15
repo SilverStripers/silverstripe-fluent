@@ -2,16 +2,20 @@
 
 namespace TractorCow\Fluent\Task;
 
+use function array_keys;
+use SilverStripe\CMS\Model\SiteTree;
 use SilverStripe\Core\ClassInfo;
 use SilverStripe\Core\Convert;
 use SilverStripe\Dev\BuildTask;
 use SilverStripe\Dev\Debug;
+use SilverStripe\ORM\DataList;
 use SilverStripe\ORM\DataObject;
 use SilverStripe\ORM\DB;
 use SilverStripe\ORM\Queries\SQLSelect;
 use SilverStripe\Security\DefaultAdminService;
 use SilverStripe\Security\Member;
 use SilverStripe\Security\Security;
+use SilverStripe\SiteConfig\SiteConfig;
 use SilverStripe\Versioned\Versioned;
 use TractorCow\Fluent\Extension\FluentExtension;
 use TractorCow\Fluent\Extension\FluentFilteredExtension;
@@ -103,6 +107,7 @@ class ConvertTranslatableTask extends BuildTask
 
                     foreach ($classes as $class) {
                         /** @var DataObject $class */
+                        if ($class == SiteConfig::class) continue;
 
                         // Ensure that a translationgroup table exists for this class
                         $baseTable = DataObject::getSchema()->baseDataTable($class);
@@ -121,62 +126,101 @@ class ConvertTranslatableTask extends BuildTask
                             $class::remove_extension(FluentFilteredExtension::class);
                         }
 
-                        // Select all instances of this class in the base table, where the Locale field is not null.
-                        // Translatable has a Locale column on the base table in SS3, but Fluent doesn't use it. Newly
-                        // created records via SS4 Fluent will not set this column, but will set it in {$baseTable}_Localised
-                        $instances = DataObject::get($class, sprintf(
-                            '"%s"."Locale" IS NOT NULL',
-                            $baseTable
-                        ));
+                        $translationGroups = SQLSelect::create()
+                            ->setFrom($groupTable)
+                            ->setDistinct(true)
+                            ->setSelect('"TranslationGroupID"')
+                            ->execute();
 
-                        foreach ($instances as $instance) {
-                            /** @var DataObject $instance */
+                        $arrInstancesToBeDeleted = [];
 
-                            // Get the Locale column directly from the base table, since the SS ORM will not include it
-                            $instanceLocale = SQLSelect::create()
-                                ->setFrom("\"{$baseTable}\"")
-                                ->setSelect('"Locale"')
-                                ->setWhere(["\"{$baseTable}\".\"ID\"" => $instance->ID])
-                                ->execute()
-                                ->first();
+                        while ($group = $translationGroups->next()) {
+                            $queryForGroup = SQLSelect::create()
+                                ->setFrom($baseTable)
+                                ->addInnerJoin($groupTable, "$baseTable.ID = $groupTable.OriginalID")
+                                ->setSelect([
+                                    'OriginalID' => 'OriginalID',
+                                    'ID' => $baseTable.'.ID',
+                                    'TranslationGroupID' => 'TranslationGroupID',
+                                ])
+                                ->addWhere('TranslationGroupID = '.$group['TranslationGroupID'])
+                                ->setOrderBy('OriginalID ASC');
+                            $arrBaseRecord = $queryForGroup->execute()->first();
+                            $baseRecord = DataObject::get($class)->byID($arrBaseRecord['ID']);
 
-                            // Ensure that we got the Locale out of the base table before continuing
-                            if (empty($instanceLocale['Locale'])) {
-                                Debug::message("Skipping {$instance->Title} with ID {$instanceID} - couldn't find Locale");
-                                continue;
-                            }
-                            $instanceLocale = $instanceLocale['Locale'];
+                            $recordsForGroup = $queryForGroup->execute();
+                            while ($record = $recordsForGroup->next()) {
+                                $recordID = $record['ID'];
 
-                            // Check for obsolete classes that don't need to be handled any more
-                            if ($instance->ObsoleteClassName) {
+                                /** @var DataObject $instance */
+                                $instance = DataObject::get($class)->byID($recordID);
+
+                                // Get the Locale column directly from the base table, since the SS ORM will not include it
+                                $instanceLocale = SQLSelect::create()
+                                    ->setFrom("\"{$baseTable}\"")
+                                    ->setSelect('"Locale"')
+                                    ->setWhere(["\"{$baseTable}\".\"ID\"" => $instance->ID])
+                                    ->execute()
+                                    ->first();
+
+                                // Ensure that we got the Locale out of the base table before continuing
+                                if (empty($instanceLocale['Locale'])) {
+                                    Debug::message("Skipping {$instance->Title} with ID {$instance->ID} - couldn't find Locale");
+                                    continue;
+                                }
+                                $instanceLocale = $instanceLocale['Locale'];
+
+                                // Check for obsolete classes that don't need to be handled any more
+                                if ($instance->ObsoleteClassName) {
+                                    Debug::message(
+                                        "Skipping {$instance->ClassName} with ID {$instance->ID} because it from an obsolete class",
+                                        false
+                                    );
+                                    continue;
+                                }
+
+                                $instanceToWrite = $instance;
+
+                                // if
+                                if ($instance->ID != $baseRecord->ID) {
+                                    $arrData = $instance->toMap();
+                                    unset($arrData['ID']);
+                                    $instanceToWrite = $baseRecord->update($arrData);
+                                    $arrInstancesToBeDeleted[] = $instance;
+                                }
+
+
+                                FluentState::singleton()
+                                    ->withState(function (FluentState $state) use ($instanceToWrite, $instanceLocale) {
+                                        // Use Fluent's ORM to write and/or publish the record into the correct locale
+                                        // from Translatable
+                                        $state->setLocale($instanceLocale);
+
+                                        if (!$this->isPublished($instanceToWrite)) {
+                                            $instanceToWrite->write();
+                                            Debug::message("  --  Saved to draft", false);
+                                        } elseif ($instanceToWrite->publishRecursive() === false) {
+                                            Debug::message("  --  Publishing FAILED", false);
+                                            throw new Exception("Failed to publish");
+                                        } else {
+                                            Debug::message("  --  Published", false);
+                                        }
+                                    });
+
                                 Debug::message(
-                                    "Skipping {$instance->ClassName} with ID {$instanceID} because it from an obsolete class",
+                                    "Updating {$instance->ClassName} {$instance->Title} ({$instance->ID}) with locale {$instanceLocale}",
                                     false
                                 );
-                                continue;
                             }
 
-                            Debug::message(
-                                "Updating {$instance->ClassName} {$instance->Title} ({$instance->ID}) with locale {$instanceLocale}",
-                                false
-                            );
+                        }
 
-                            FluentState::singleton()
-                                ->withState(function (FluentState $state) use ($instance, $instanceLocale) {
-                                    // Use Fluent's ORM to write and/or publish the record into the correct locale
-                                    // from Translatable
-                                    $state->setLocale($instanceLocale);
-
-                                    if (!$this->isPublished($instance)) {
-                                        $instance->write();
-                                        Debug::message("  --  Saved to draft", false);
-                                    } elseif ($instance->publishRecursive() === false) {
-                                        Debug::message("  --  Publishing FAILED", false);
-                                        throw new Exception("Failed to publish");
-                                    } else {
-                                        Debug::message("  --  Published", false);
-                                    }
-                                });
+                        foreach ($arrInstancesToBeDeleted as $item) {
+                            if ($item->hasExtension(Versioned::class)) {
+                                $item->doArchive();
+                            } else {
+                                $item->delete();
+                            }
                         }
 
                         // Drop the "Locale" column from the base table
